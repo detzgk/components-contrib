@@ -67,7 +67,7 @@ const (
 	end;
 	local fwr = redis.pcall("JSON.GET", KEYS[1], ".first-write");
 	if etag == ARGV[1] or ((not fwr or type(fwr) == "table") and ARGV[1] == "0") then
-	  redis.call("JSON.SET", KEYS[1], "$", ARGV[2]);
+	  redis.call("JSON.SET", KEYS[1], ".", ARGV[2]);
 	  if ARGV[3] == "0" then
 	    redis.call("JSON.SET", KEYS[1], ".first-write", 0);
 	  end;
