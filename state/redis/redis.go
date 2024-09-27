@@ -75,9 +75,46 @@ const (
 	else
 	  return error("failed to set key " .. KEYS[1])
 	end`
+	setJSONPathQuery = `
+	local etag = redis.pcall("JSON.GET", KEYS[1], "$.version");
+	if type(etag) == "table" then
+	  redis.call("JSON.DEL", KEYS[1]);
+	  etag = ARGV[1]
+	elseif etag then
+	  etag = tostring(cjson.decode(etag)[1]);
+	end;
+	if not etag or etag == "" then
+	  etag = ARGV[1];
+	end;
+	local fwr = redis.pcall("JSON.GET", KEYS[1], "$.first-write");
+	if type(fwr) == "table" then
+	  fwr = nil;
+	elseif fwr then
+	  fwr = cjson.decode(fwr)[1];
+	end;
+	if etag == ARGV[1] or (not fwr and ARGV[1] == "0") then
+	  redis.call("JSON.SET", KEYS[1], "$", ARGV[2]);
+	  if ARGV[3] == "0" then
+	    redis.call("JSON.SET", KEYS[1], "$.first-write", 0);
+	  end;
+	  return redis.call("JSON.SET", KEYS[1], "$.version", (etag+1))
+	else
+	  return error("failed to set key " .. KEYS[1])
+	end`
 	delJSONQuery = `
 	local etag = redis.pcall("JSON.GET", KEYS[1], ".version");
 	if not etag or type(etag)=="table" or etag == ARGV[1] or etag == "" or ARGV[1] == "0" then
+	  return redis.call("JSON.DEL", KEYS[1])
+	else
+	  return error("failed to delete " .. KEYS[1])
+	end`
+	delJSONPathQuery = `
+	local etag = redis.pcall("JSON.GET", KEYS[1], "$.version");
+	if type(etag)=="table" then
+	  return redis.call("JSON.DEL", KEYS[1])
+	end
+	etag = tostring(cjson.decode(etag)[1])
+	if not etag or etag == ARGV[1] or etag == "" or ARGV[1] == "0" then
 	  return redis.call("JSON.DEL", KEYS[1])
 	else
 	  return error("failed to delete " .. KEYS[1])
@@ -97,6 +134,7 @@ type StateStore struct {
 	client                         rediscomponent.RedisClient
 	clientSettings                 *rediscomponent.Settings
 	clientHasJSON                  bool
+	clientSupportsJSONPath         bool
 	json                           jsoniter.API
 	replicas                       int
 	querySchemas                   querySchemas
@@ -153,7 +191,28 @@ func (r *StateStore) Init(ctx context.Context, metadata state.Metadata) error {
 		return fmt.Errorf("redis store: error registering query schemas: %w", err)
 	}
 
-	r.clientHasJSON = rediscomponent.ClientHasJSONSupport(r.client)
+	serverInfo, err := rediscomponent.GetServerInfo(r.client)
+	if err != nil {
+		return fmt.Errorf("redis store: error querying server info: %w", err)
+	}
+
+	if _, ok := serverInfo["upstash_version"]; ok {
+		// Upstash supports these things but doesn't support listing modules
+		r.clientHasJSON = true
+		r.clientSupportsJSONPath = true
+	} else {
+		modules, err := rediscomponent.GetModuleList(r.client)
+		if err != nil {
+			return fmt.Errorf("redis store: error listing server modules: %w", err)
+		}
+		version, ok := modules["ReJSON"]
+		if ok {
+			r.clientHasJSON = true
+			if version >= 20000 {
+				r.clientSupportsJSONPath = true
+			}
+		}
+	}
 
 	return nil
 }
@@ -209,7 +268,7 @@ func (r *StateStore) Delete(ctx context.Context, req *state.DeleteRequest) error
 	}
 
 	if req.Metadata[daprmetadata.ContentType] == contenttype.JSONContentType && r.clientHasJSON {
-		err = r.client.DoWrite(ctx, "EVAL", delJSONQuery, 1, req.Key, *req.ETag)
+		err = r.client.DoWrite(ctx, "EVAL", r.delJsonQuery(), 1, req.Key, *req.ETag)
 	} else {
 		err = r.client.DoWrite(ctx, "EVAL", delDefaultQuery, 1, req.Key, *req.ETag)
 	}
@@ -347,7 +406,7 @@ func (r *StateStore) Set(ctx context.Context, req *state.SetRequest) error {
 
 	if req.Metadata[daprmetadata.ContentType] == contenttype.JSONContentType && r.clientHasJSON {
 		bt, _ := utils.Marshal(&jsonEntry{Data: req.Value}, r.json.Marshal)
-		err = r.client.DoWrite(ctx, "EVAL", setJSONQuery, 1, req.Key, ver, bt, firstWrite)
+		err = r.client.DoWrite(ctx, "EVAL", r.setJsonQuery(), 1, req.Key, ver, bt, firstWrite)
 	} else {
 		bt, _ := utils.Marshal(req.Value, r.json.Marshal)
 		err = r.client.DoWrite(ctx, "EVAL", setDefaultQuery, 1, req.Key, ver, bt, firstWrite)
@@ -415,7 +474,7 @@ func (r *StateStore) Multi(ctx context.Context, request *state.TransactionalStat
 				(len(req.Metadata) > 0 && req.Metadata[daprmetadata.ContentType] == contenttype.JSONContentType)
 			if isReqJSON {
 				bt, _ = utils.Marshal(&jsonEntry{Data: req.Value}, r.json.Marshal)
-				pipe.Do(ctx, "EVAL", setJSONQuery, 1, req.Key, ver, bt)
+				pipe.Do(ctx, "EVAL", r.setJsonQuery(), 1, req.Key, ver, bt)
 			} else {
 				bt, _ = utils.Marshal(req.Value, r.json.Marshal)
 				pipe.Do(ctx, "EVAL", setDefaultQuery, 1, req.Key, ver, bt)
@@ -434,7 +493,7 @@ func (r *StateStore) Multi(ctx context.Context, request *state.TransactionalStat
 			isReqJSON := isJSON ||
 				(len(req.Metadata) > 0 && req.Metadata[daprmetadata.ContentType] == contenttype.JSONContentType)
 			if isReqJSON {
-				pipe.Do(ctx, "EVAL", delJSONQuery, 1, req.Key, *req.ETag)
+				pipe.Do(ctx, "EVAL", r.delJsonQuery(), 1, req.Key, *req.ETag)
 			} else {
 				pipe.Do(ctx, "EVAL", delDefaultQuery, 1, req.Key, *req.ETag)
 			}
@@ -552,4 +611,20 @@ func (r *StateStore) GetComponentMetadata() (metadataInfo daprmetadata.MetadataM
 	settingsStruct := rediscomponent.Settings{}
 	daprmetadata.GetMetadataInfoFromStructType(reflect.TypeOf(settingsStruct), &metadataInfo, daprmetadata.StateStoreType)
 	return
+}
+
+func (r *StateStore) setJsonQuery() string {
+	if r.clientSupportsJSONPath {
+		return setJSONPathQuery
+	} else {
+		return setJSONQuery
+	}
+}
+
+func (r *StateStore) delJsonQuery() string {
+	if r.clientSupportsJSONPath {
+		return delJSONPathQuery
+	} else {
+		return delJSONQuery
+	}
 }

@@ -367,6 +367,87 @@ func GetServerVersion(c RedisClient) (string, error) {
 	return "", errors.New("could not find redis_version in redis info response")
 }
 
+func GetServerInfo(c RedisClient) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	res, err := c.DoRead(ctx, "INFO", "server")
+	if err != nil {
+		return nil, err
+	}
+
+	info := make(map[string]string)
+	rows := strings.Split(strings.ReplaceAll(res.(string), "\r\n", "\n"), "\n")
+	for _, row := range rows {
+		if i := strings.Index(row, "#"); i != -1 {
+			row = strings.TrimSpace(row[:i])
+		}
+
+		if len(row) == 0 {
+			continue
+		}
+
+		rowSplit := strings.SplitN(row, ":", 2)
+		if len(rowSplit) != 2 {
+			return nil, fmt.Errorf("redis server info: expected key:value, got %s", row)
+		}
+		info[rowSplit[0]] = rowSplit[1]
+	}
+
+	return info, nil
+}
+
+func GetModuleList(c RedisClient) (map[string]int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	res, err := c.DoRead(ctx, "MODULE", "LIST")
+	if err != nil {
+		return nil, err
+	}
+
+	list, ok := res.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected response format in server module list")
+	}
+
+	modules := make(map[string]int64)
+
+	for _, row := range list {
+		// RESP2 and RESP3 respond in different formats to this command
+		if l, ok := row.([]interface{}); ok {
+			var name string
+			var ver int64
+			for i := 0; i < len(l); i += 2 {
+				if l[i] == "name" {
+					name, ok = l[i+1].(string)
+					if !ok {
+						return nil, fmt.Errorf("unexpected value for module name: %v", l)
+					}
+				} else if l[i] == "ver" {
+					ver, ok = l[i+1].(int64)
+					if !ok {
+						return nil, fmt.Errorf("unexpected value for module name: %v", l)
+					}
+				}
+			}
+			modules[name] = ver
+		} else if m, ok := row.(map[interface{}]interface{}); ok {
+			name, ok := m["name"].(string)
+			if !ok {
+				return nil, fmt.Errorf("unexpected value for module name: %v", m)
+			}
+			ver, ok := m["ver"].(int64)
+			if !ok {
+				return nil, fmt.Errorf("unexpected value for module version: %v", m)
+			}
+			modules[name] = ver
+		}
+	}
+
+	return modules, nil
+}
+
 // GetConnectedSlaves returns the number of slaves connected to the Redis master.
 func GetConnectedSlaves(ctx context.Context, c RedisClient) (int, error) {
 	const connectedSlavesReplicas = "connected_slaves:"
